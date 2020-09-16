@@ -11,6 +11,7 @@ using GPUCompiler
 using Adapt
 using Requires
 import LinearAlgebra
+using Printf
 
 ### Exports ###
 
@@ -72,9 +73,9 @@ include("array.jl")
 #include("subarray.jl")
 #include("utils.jl")
 #include("indexing.jl")
-#include("broadcast.jl")
+include("broadcast.jl")
 #include("matmul.jl")
-#include("mapreduce.jl")
+include("mapreduce.jl")
 #include("gpuarray_interface.jl")
 
 roc(xs) = adapt(ROCArray{Float32}, xs)

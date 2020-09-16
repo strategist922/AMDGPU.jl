@@ -1,4 +1,4 @@
-export OutputContext, @rocprint, @rocprintln
+export OutputContext, @rocprint, @rocprintln, @rocprintf, @rocprintfw
 
 "Internal representation of a static string."
 struct DeviceStaticString{N} end
@@ -95,11 +95,108 @@ function rocprint!(ex, N, oc, iex::Expr)
     end
     return N
 end
-#= TODO: Support printing arbitrary values?
-function rocprint!(ex, N, oc, sym::Symbol)
-    push!(ex.args, :($rocprint!($(esc(oc)), $(QuoteNode(sym)))))
-    return N+4
+function rocprint!(ex, N, oc, sym::S) where S
+    error("Dynamic printing of $S only supported via @rocprintf")
+end
+
+## @rocprintf
+
+macro rocprintf(fmt, args...)
+    ex = Expr(:block)
+    @gensym device_ptr device_fmt_ptr printf_hc
+    push!(ex.args, :($device_fmt_ptr = AMDGPU.alloc_string($(Val(Symbol(fmt))))))
+    push!(ex.args, :($printf_hc = unsafe_load(AMDGPU.get_global_pointer(Val(:__global_printf_context),
+                                                                        HostCall{UInt64,Int64,DevicePtr{ROCPrintfBuffer,AS.Global}}))))
+    push!(ex.args, :($device_ptr = $printf_hc.buf_ptr))
+    push!(ex.args, :($device_ptr = AMDGPU._rocprintf_fmt($device_ptr, $device_fmt_ptr, $(sizeof(fmt)))))
+    for arg in args
+        push!(ex.args, :($device_ptr = AMDGPU._rocprintf_arg($device_ptr, $arg)))
+    end
+    push!(ex.args, :(AMDGPU.hostcall!($printf_hc, ROCPrintfBuffer())))
+    ex
+end
+
+macro rocprintfw(fmt, args...)
+    quote
+        AMDGPU.wave_serialized() do
+            @rocprintf($fmt, $(args...))
+        end
+    end
+end
+
+# Serializes execution of a function within a wavefront
+# From implementation by @jonathanvdc in CUDAnative.jl#419
+function wave_serialized(func::Function)
+    # Get the current thread's ID
+    thread_id = workitemIdx().x - 1
+
+    # Get the size of a wavefront
+    size = wavefrontsize()
+
+    local result
+    i = 0
+    while i < size
+        if thread_id % size == i
+            result = func()
+        end
+        i += 1
+    end
+    return result
+end
+
+struct ROCPrintfBuffer end
+Base.sizeof(::ROCPrintfBuffer) = 0
+Base.unsafe_store!(::DevicePtr{ROCPrintfBuffer,as} where as, x) = nothing
+function Base.unsafe_load(ptr::DevicePtr{ROCPrintfBuffer,as} where as)
+    ptr = Base.unsafe_convert(DevicePtr{UInt8,AS.Global}, ptr)
+    fmt = Base.unsafe_string(convert(Ptr{UInt8}, ptr))
+    ptr += sizeof(fmt)+1
+    args = []
+    while true
+        name = Base.unsafe_string(convert(Ptr{UInt8}, ptr))
+        name == "" && break
+        T = eval(Meta.parse(name))
+        ptr += sizeof(name)+1
+        arg = unsafe_load(Base.unsafe_convert(DevicePtr{T,AS.Global}, ptr))
+        push!(args, arg)
+        ptr += sizeof(arg)
+    end
+    return (fmt, args)
+end
+function _rocprintf_fmt(ptr, fmt_ptr, fmt_len)
+    AMDGPU.memcpy!(ptr, fmt_ptr, fmt_len)
+    unsafe_store!(ptr+fmt_len, UInt8(0))
+    return ptr+fmt_len+1
+end
+function _rocprintf_arg(ptr, arg::T) where T
+    T_str, T_str_len = _rocprintf_T_str(T)
+    AMDGPU.memcpy!(ptr, T_str, T_str_len)
+    ptr += T_str_len
+    unsafe_store!(ptr, UInt8(0))
+    ptr += 1
+    unsafe_store!(Base.unsafe_convert(DevicePtr{T,AS.Global}, ptr), arg)
+    ptr += sizeof(arg)
+    return ptr
+end
+#= TODO: Not really useful until we can work with device-side strings
+function _rocprintf_string(ptr, str::String)
+    @gensym T_str T_str_len str_ptr
+    quote
+        $T_str, $T_str_len = AMDGPU._rocprintf_T_str(String)
+        AMDGPU.memcpy!($ptr, $T_str, $T_str_len)
+        $ptr += $T_str_len
+        unsafe_store!($ptr, UInt8(0))
+        $ptr += 1
+        $str_ptr = Base.unsafe_convert(DevicePtr{UInt8,AS.Generic}, $str_ptr)
+        $str_ptr = AMDGPU.alloc_string($(Val(Symbol(str))))
+        AMDGPU.memcpy!($ptr, $str_ptr, $(length(str)))
+        $ptr += $(length(str))
+        $ptr
+    end
 end
 =#
-
-### runtime helpers
+@generated function _rocprintf_T_str(::Type{T}) where T
+    quote
+        (AMDGPU.alloc_string($(Val(Symbol(repr(T))))), $(sizeof(repr(T))))
+    end
+end

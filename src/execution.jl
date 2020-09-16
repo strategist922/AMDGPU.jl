@@ -11,8 +11,8 @@ function split_kwargs(kwargs)
     macro_kws    = [:dynamic]
     compiler_kws = [:name, :device, :queue]
     call_kws     = [:gridsize, :groupsize, :config, :queue]
-    alias_kws    = Dict(:blocks=>:gridsize, :threads=>:groupsize,
-                        :agent=>:device, :stream=>:queue)
+    alias_kws    = Dict(:agent=>:device, :stream=>:queue)
+                        # FIXME: These should be computed: :blocks=>:gridsize, :threads=>:groupsize,
     macro_kwargs = []
     compiler_kwargs = []
     call_kwargs = []
@@ -353,6 +353,19 @@ function _rocfunction(source::FunctionSpec; device=default_device(), queue=defau
         Base.unsafe_store!(gbl_ptr, oc)
     end
 
+    # initialize global printf context
+    if any(x->x[1]==:__global_printf_context, globals)
+        gbl = get_global(exe, :__global_printf_context)
+        # Return type of Int to force synchronizing behavior for @rocprintfw
+        gbl_ptr = Base.unsafe_convert(Ptr{HostCall{UInt64,Int,Tuple{DevicePtr{UInt8,AS.Global}}}}, gbl)
+        hc = HostCall(Int, Tuple{DevicePtr{UInt8,AS.Global}}; agent=device.device, continuous=true, buf_size=2^16) do _
+            fmt, args = unsafe_load(Base.unsafe_convert(DevicePtr{ROCPrintfBuffer,AS.Global}, hc.buf_ptr))
+            @eval @printf($fmt, $(args...))
+            return 0
+        end
+        Base.unsafe_store!(gbl_ptr, hc)
+    end
+
     # initialize global exception flag
     if any(x->x[1]==:__global_exception_flag, globals)
         gbl = get_global(exe, :__global_exception_flag)
@@ -475,3 +488,25 @@ end
 
 # https://github.com/JuliaLang/julia/issues/14919
 (kernel::DeviceKernel)(args...; kwargs...) = call(kernel, args...; kwargs...)
+
+## other
+
+# TODO: Actually query wavefront size
+wavefrontsize(agent::HSAAgent) = 64
+
+"""
+    nextwavefront(dev, threads)
+    prevwavefront(dev, threads)
+
+Returns the next or previous nearest number of threads that is a multiple of the wavefront size
+of a device `dev`. This is a common requirement when using intra-wavefront communication.
+"""
+function nextwavefront(agent::HSAAgent, threads::Integer)
+    ws = wavefrontsize(agent)
+    return threads + (ws - threads % ws) % ws
+end
+
+@doc (@doc nextwavefront) function prevwavefront(agent::HSAAgent, threads::Integer)
+    ws = wavefrontsize(agent)
+    return threads - Base.rem(threads, ws)
+end

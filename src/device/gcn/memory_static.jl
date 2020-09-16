@@ -1,4 +1,4 @@
-export alloc_special, alloc_local
+export @alloc_special, alloc_special, alloc_local
 
 "Allocates on-device memory statically from the specified address space."
 @generated function alloc_special(::Val{id}, ::Type{T}, ::Val{as}, ::Val{len}) where {id,T,as,len}
@@ -43,8 +43,15 @@ export alloc_special, alloc_local
         call_function(llvm_f, DevicePtr{T,as})
     end
 end
-
-@inline alloc_local(id, T, len) = alloc_special(Val(id), Val(T), Val(AS.Local), Val(len))
+macro alloc_special(as, T, dims)
+    id = gensym("static_$(as)_mem")
+    quote
+        len = prod($(esc(dims)))
+        ptr = alloc_special(Val($(QuoteNode(id))), $(esc(T)), Val($(esc(as))), Val(len))
+        ROCDeviceArray($(esc(dims)), ptr)
+    end
+end
+@inline alloc_local(id, T, len) = alloc_special(Val(id), T, Val(AS.Local), Val(len))
 
 @inline @generated function alloc_string(::Val{str}) where str
     JuliaContext() do ctx

@@ -17,7 +17,7 @@ struct HostCall{S,RT,AT}
     buf_len::UInt
 end
 function HostCall(RT::Type, AT::Type{<:Tuple}, signal::S;
-                    agent=get_default_agent()) where S
+                  agent=get_default_agent(), buf_size=nothing) where S
     @assert S == UInt64
     # TODO: Just use atomic_add!
     host_sentinel, device_sentinel = lock(SENTINEL_LOCK) do
@@ -31,15 +31,17 @@ function HostCall(RT::Type, AT::Type{<:Tuple}, signal::S;
         end
         return host_sentinel, device_sentinel
     end
-    buf_len = 0
-    for T in AT.parameters
-        @assert isbitstype(T) "Hostcall arguments must be bits-type"
-        buf_len += sizeof(T)
+    if buf_size === nothing
+        buf_size = 0
+        for T in AT.parameters
+            @assert isbitstype(T) "Hostcall arguments must be bits-type"
+            buf_size += sizeof(T)
+        end
     end
-    buf_len = max(sizeof(UInt64), buf_len) # make room for return buffer pointer
-    buf = Mem.alloc(agent, buf_len; coherent=true)
+    buf_size = max(sizeof(UInt64), buf_size) # make room for return buffer pointer
+    buf = Mem.alloc(agent, buf_size; coherent=true)
     buf_ptr = DevicePtr{UInt8,AS.Global}(Base.unsafe_convert(Ptr{UInt8}, buf))
-    HostCall{S,RT,AT}(signal, host_sentinel, device_sentinel, buf_ptr, buf_len)
+    HostCall{S,RT,AT}(signal, host_sentinel, device_sentinel, buf_ptr, buf_size)
 end
 
 ## device signal functions
@@ -179,9 +181,9 @@ Note: This API is currently experimental and is subject to change at any time.
 """
 function HostCall(func, rettype, argtypes; return_task=false,
                   agent=get_default_agent(), maxlat=DEFAULT_HOSTCALL_LATENCY,
-                  continuous=false)
+                  continuous=false, buf_size=nothing)
     signal = HSASignal()
-    hc = HostCall(rettype, argtypes, signal.signal[].handle; agent=agent)
+    hc = HostCall(rettype, argtypes, signal.signal[].handle; agent=agent, buf_size=buf_size)
 
     tsk = @async begin
         ret_buf = Ref{Mem.Buffer}()
@@ -205,6 +207,8 @@ function HostCall(func, rettype, argtypes; return_task=false,
                 ret = try
                     func(args...,)
                 catch err
+                    Base.showerror(stderr, err)
+                    Base.show_backtrace(stderr, catch_backtrace())
                     throw(HostCallException("Hostcall: Error executing host function"))
                 end
                 rettype === Nothing && return
